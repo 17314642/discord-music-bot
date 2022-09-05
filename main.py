@@ -19,8 +19,7 @@ from discord.voice_client import VoiceClient
 from youtube_dl import YoutubeDL
 
 try:
-    # BOT_TOKEN = os.environ['BOT_TOKEN']
-    BOT_TOKEN = "NzM1MDcwMjM4MzcwMDM3ODIw.Xxa5gQ.bfNEXcPg6-rJdKhUh29DTOKsK6w"
+    BOT_TOKEN = os.environ['BOT_TOKEN']
 except KeyError:
     print("Токен не был указан. Укажите его в \"start.sh\"")
     exit()
