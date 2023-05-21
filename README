@@ -2,6 +2,5 @@
 You may not download it if you don't want to play age-restricted videos (some music video clips and other stuff marked 'not for kids').
 2) Create your discord bot on 'https://discord.com/developers/applications'.
 3) Enter your discord bot token in start.sh
-4) Create a virtual python environment so you won't get your home directory clogged up with unnecessary python modules: python3 -m venv .
-5) chmod +x start.sh && ./start.sh
-6) Invite your bot to your server.
+4) chmod +x start.sh && ./start.sh
+5) Invite your bot to your server.
