@@ -8,7 +8,7 @@ import os
 
 # Discord bot API
 import discord
-import youtube_dl.YoutubeDL
+import yt_dlp.YoutubeDL
 from discord.errors import ClientException
 from discord.ext import commands
 from discord import FFmpegPCMAudio
@@ -16,7 +16,7 @@ from discord.utils import get
 from discord.voice_client import VoiceClient
 
 # Video download
-from youtube_dl import YoutubeDL
+from yt_dlp import YoutubeDL
 
 try:
     BOT_TOKEN = os.environ['BOT_TOKEN']
@@ -53,14 +53,25 @@ def replace_from_end(string: str, replace_string: str):
 def add_track_to_queue(track, guild: discord.Guild):
     global TRACK_QUEUE
 
+    # 1 video has multiple qualities, select highest one.
+    # TODO: Maybe add option for lower qualities?
+    track_url = ""
+    track_tbr = 0
+
+    for i, tr in enumerate(track["formats"]):
+        if tr["acodec"] != "none" and tr["tbr"] > track_tbr:
+            # print(tr["tbr"], ">", track_tbr)
+            track_tbr = tr["tbr"]
+            track_url = tr["url"]
+
     try:
         TRACK_QUEUE[guild.id].append(
-            {"title": track["title"], "url": track["formats"][0]["url"], "duration": track["duration"],
+            {"title": track["title"], "url": track_url, "duration": track["duration"],
              "isCurrentTrack": False})
     except KeyError:
         TRACK_QUEUE[guild.id] = []
         TRACK_QUEUE[guild.id].append(
-            {"title": track["title"], "url": track["formats"][0]["url"], "duration": track["duration"],
+            {"title": track["title"], "url": track_url, "duration": track["duration"],
              "isCurrentTrack": False})
 
     # os.system("clear")
@@ -232,7 +243,7 @@ async def play(ctx: commands.Context, *, query: str = None):
             except KeyError:
                 video = videos
                 add_track_to_queue(video, ctx.guild)
-        except youtube_dl.utils.DownloadError as error:
+        except yt_dlp.utils.DownloadError as error:
             try:
                 video = ydl.extract_info(f"ytsearch:{query}", download=False)['entries'][0]
                 add_track_to_queue(video, ctx.guild)
