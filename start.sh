@@ -1,6 +1,6 @@
 #!/bin/bash
 
-export BOT_TOKEN="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+export BOT_TOKEN="$(tr -d '\n' < token.txt)"
 
 python3 -m venv venv
 source venv/bin/activate
