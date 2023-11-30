@@ -7,17 +7,19 @@ import re
 import os
 import typing
 import functools
+import json
+import logging
+import logging.handlers
 
 # Discord bot API
 import discord
-import yt_dlp.YoutubeDL
 from discord.errors import ClientException
 from discord.ext import commands
 from discord import FFmpegPCMAudio
-from discord.utils import get
 from discord.voice_client import VoiceClient
 
 # Video download
+import yt_dlp.YoutubeDL
 from yt_dlp import YoutubeDL
 
 try:
@@ -27,11 +29,12 @@ except KeyError:
     exit()
 
 TRACK_QUEUE = {}
+LOGGER = None
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="-", description="This is a Random Bot", intents=intents)
 
-bIsSearchStarted = False
+IS_SEARCH_STARTED = False
 FFMPEG_OPTS = {"before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
                "options": "-vn -bufsize 8192k"}
 
@@ -49,145 +52,196 @@ class YoutubeDL_Logger:
 
 
 def replace_from_end(string: str, replace_string: str):
-    return string[:string.rfind(replace_string)] + string[string.rfind(replace_string) + 1:]
+    idx = string.rfind(replace_string)
+    return string[:idx] + string[idx + 1:]
 
 
-async def yt_dlp_search_blocking(blocking_func: typing.Callable, *args, **kwargs) -> typing.Any:
+def get_pretty_exception_str(e, **kwargs):
+    lines = []
+
+    lines.append("================================")
+    lines.append("Exception caught:")
+    lines.append(f"    e = \"{e}\"")
+    lines.append(f"    type = \"{type(e)}\"")
+
+    for k in kwargs.keys():
+        lines.append(f"    {k} = {kwargs[k]}")
+
+    lines.append("================================")
+
+    return "\n".join(lines)
+
+
+def yt_dlp_search_blocking(cmd, query, is_query_url):
+    options = {
+        'format': 'bestaudio',
+        'quiet': 'True',
+        'cookiefile': 'cookies.txt',
+        "logger": YoutubeDL_Logger
+    }
+
+    with YoutubeDL(options) as ydl:
+        ytsearch_str = "ytsearch:"
+        if cmd == "search":
+            ytsearch_str = "ytsearch15:" # Extract 15 videos
+
+        if is_query_url:
+            output = ydl.extract_info(query, download=False)
+        else:
+            output = ydl.extract_info(f"{ytsearch_str}{query}", download=False)
+
+        if "playlist_count" in output.keys() or cmd == "search":
+            output = output["entries"]
+        else:
+            output = [output]
+
+        with open("output.json", "w") as f:
+            f.write(json.dumps(output, indent=4))
+
+        LOGGER.info(f"yt_dlp_search_blocking(): query=\"{query}\" type=\"{type(output)}\"")
+        return output
+
+
+async def yt_dlp_search_async(*args, **kwargs) -> typing.Any:
     """Runs a blocking function in a non-blocking way"""
-    func = functools.partial(blocking_func, *args, **kwargs) # `run_in_executor` doesn't support kwargs, `functools.partial` does
+    blocking_func: typing.Callable = yt_dlp_search_blocking
+    # `run_in_executor` doesn't support kwargs, `functools.partial` does
+    func = functools.partial(blocking_func, *args, **kwargs)
     return await bot.loop.run_in_executor(None, func)
 
 
-def add_track_to_queue(track, guild: discord.Guild):
+def init_track_list(guild_id: int):
     global TRACK_QUEUE
+    TRACK_QUEUE[guild_id] = {}
+    TRACK_QUEUE[guild_id]["tracks"] = []
+    TRACK_QUEUE[guild_id]["current_track"] = 0
 
-    # 1 video has multiple qualities, select highest one.
-    # TODO: Maybe add option for lower qualities?
-    track_url = ""
-    track_tbr = 0
 
-    for i, tr in enumerate(track["formats"]):
-        if "acodec" in tr.keys() and tr["acodec"] != "none":
-            print(f"Track {i}:")
-            print(f"    url   : {tr['url']}")
-            print(f"    acodec: {tr['acodec']}")
-            if tr["tbr"] > track_tbr:
-                print(tr["tbr"], ">", track_tbr)
-                track_tbr = tr["tbr"]
-                track_url = tr["url"]
-
+def add_tracks_to_queue(tracks: list, guild: discord.Guild):
     if not guild.id in TRACK_QUEUE.keys():
-        TRACK_QUEUE[guild.id] = []
+        init_track_list(guild.id)
 
-    print(track_url)
-    TRACK_QUEUE[guild.id].append({
-        "title": track["title"],
-        "url": track_url,
-        "duration": track["duration"],
-        "isCurrentTrack": False
-    })
-
-    # os.system("clear")
-    # print(f"Numbers of servers: {len(TRACK_QUEUE)}")
-    # i = 0
-    # for server in TRACK_QUEUE:
-    #     i += 1
-    #     print(f"{i}. {bot.get_guild(server)}")
-    #     for k in range(len(TRACK_QUEUE[server])):
-    #         print(f"    {i}.{k + 1}. {TRACK_QUEUE[server][k]['title']}")
-    #     print()
+    for t in tracks:
+        if type(t) == str:
+            print(f"t = \"{t}\"")
+        TRACK_QUEUE[guild.id]["tracks"].append({
+            "title": t["title"],
+            "yt_id": t["id"],
+            "duration": t["duration"]
+        })
 
     return len(TRACK_QUEUE) - 1
 
 
-def get_current_track(guild: discord.Guild):
-    if guild.id not in TRACK_QUEUE:
+def get_current_track_id(guild_id: int):
+    if guild_id not in TRACK_QUEUE:
         return None
 
-    for track in TRACK_QUEUE[guild.id]:
-        if track["isCurrentTrack"]:
-            return track
+    return TRACK_QUEUE[guild_id]["current_track"]
 
 
-def set_current_track(track, guild):
-    for track_in_queue in TRACK_QUEUE[guild.id]:
-        if track['title'] == track_in_queue['title'] and track['duration'] == track_in_queue['duration']:
-            for current_active_track in TRACK_QUEUE[guild.id]:
-                if current_active_track['isCurrentTrack']:
-                    current_active_track['isCurrentTrack'] = False
-                track_in_queue['isCurrentTrack'] = True
-
-
-def check_queue(current_index, guild: discord.Guild):
+def set_current_track_id(idx, guild_id):
     global TRACK_QUEUE
+    TRACK_QUEUE[guild_id]["current_track"] = idx
 
-    if current_index is None or len(TRACK_QUEUE[guild.id]) == 0:
+
+async def get_track_url(yt_id):
+    output = await yt_dlp_search_async("retrieve_url", yt_id, True)
+    return output[0]["url"]
+
+
+async def check_queue(guild_id):
+    LOGGER.info(f"check_queue({guild_id})")
+    #await message.edit(content=f"Проигрываю `{current_track['title']}`")
+    #await message.edit(content=f"Трек был добавлен в очередь: `{current_track['title']}`")
+
+    guild: discord.Guild = await bot.fetch_guild(guild_id)
+    voice: VoiceClient = guild.voice_client
+
+    if voice.is_playing():
+        LOGGER.info("Already playing. Returning.")
         return
 
-    if not current_index == len(TRACK_QUEUE[guild.id]) - 1:
-        current_index = current_index + 1
-        set_current_track(TRACK_QUEUE[guild.id][current_index], guild)
-        voice: VoiceClient = guild.voice_client
-        voice.play(FFmpegPCMAudio(TRACK_QUEUE[guild.id][current_index]['url'], **FFMPEG_OPTS),
-                   after=lambda e: check_queue(current_index, guild))
-    else:
+    cur_idx = get_current_track_id(guild_id)
+
+    if cur_idx is None:
+        LOGGER.info(f"cur_idx is None. Returning.")
         # Clear track queue
-        TRACK_QUEUE[guild.id] = []
-
-
-async def print_track_status(ctx, message, current_track):
-    if not ctx.voice_client.is_playing():
-        set_current_track(current_track, ctx.guild)
-
-        await message.edit(content=f"Проигрываю `{current_track['title']}`")
-
-        try:
-            ctx.voice_client.play(FFmpegPCMAudio(current_track['url'], **FFMPEG_OPTS),
-                                  after=lambda e: check_queue(0, ctx.guild))
-        except Exception as e:
-            print(f'Exception: type=\"{type(e)}\" str=\"{str(e)}\"')
-    else:
-        await message.edit(content=f"Трек был добавлен в очередь: `{current_track['title']}`")
-
-
-@bot.command(aliases=['s', 'S'])
-async def search(ctx: commands.Context, *, search: str = None):
-    global TRACK_QUEUE
-
-    if search is None:
-        await ctx.send("Требуется минимум одно ключевое слово!")
+        init_track_list(guild_id)
         return
+
+    track_len = len(TRACK_QUEUE[guild_id]["tracks"])
+    if cur_idx >= track_len:
+        init_track_list(guild_id)
+        return
+
+    # print(json.dumps(TRACK_QUEUE, indent=4))
+    track_url = await get_track_url(TRACK_QUEUE[guild_id]["tracks"][cur_idx]["yt_id"])
+    LOGGER.info(f"track_url = \"{track_url[:32]}\"")
+
+    try:
+        voice.play(FFmpegPCMAudio(track_url, **FFMPEG_OPTS))
+    except Exception as e:
+        msg = get_pretty_exception_str(e)
+        print(msg)
+        #await ctx.send(f"К сожалению произошла ошибка при попытке проиграть трек.\n\n{msg}")
+        return
+
+    set_current_track_id(cur_idx + 1, guild_id)
+
+
+def is_url_compliant(url: str):
+    allowed_urls = (
+        'http://youtube.com/', 'http://youtu.be/',
+        'http://www.youtube.com/', 'http://www.youtu.be/',
+        'https://youtube.com/', 'https://youtu.be/',
+        'https://www.youtube.com/', 'https://www.youtu.be/'
+    )
+
+    if url.startswith(allowed_urls):
+        return True
+
+    return False
+
+
+async def play_or_search_track(cmd: str, ctx: commands.Context, query: str = None):
+    global IS_SEARCH_STARTED
 
     voice: discord.VoiceProtocol = ctx.author.voice
+    is_query_url = False
+
+    if query is None:
+        await ctx.send("Требуется минимум одно ключевое слово!")
+        return
 
     if voice is None:
         await ctx.send("Вы должны быть в голосовом чате чтобы пользоваться ботом...")
         return
 
+    if cmd == "play" and query.startswith(('http://', 'https://')):
+        is_query_url = True
+        if not is_url_compliant(query):
+            await ctx.send("Разрешён только YouTube.")
+            return
+
     try:
         await voice.channel.connect()
     except ClientException as e:
-        if str(e) == "Already connected to a voice channel.":
-            pass
-        else:
-            exception_msg = f"Exception caught (author=\"{ctx.author}\", search=\"{search}\"): {e}"
-            print(exception_msg)
-            await ctx.send(f"К сожалению произошла ошибка. Попробуйте ещё раз... ({exception_msg})")
+        if str(e) != "Already connected to a voice channel.":
+            msg = get_pretty_exception_str(e, author=ctx.author, query=query)
+            print(msg)
+            await ctx.send(f"К сожалению произошла ошибка. Попробуйте ещё раз...\n\n{msg}")
             return
 
     last_message = await ctx.send("Обрабатываю...")
     channel = bot.get_channel(ctx.channel.id)
     message = await channel.fetch_message(last_message.id)
 
-    global bIsSearchStarted
-    bIsSearchStarted = True
+    videos = await yt_dlp_search_async(cmd, query, is_query_url)
 
-    response = ""
-
-    with YoutubeDL({'format': 'bestaudio', 'noplaylist': 'True', 'quiet': 'True', 'cookiefile': 'cookies.txt',
-                    "logger": YoutubeDL_Logger}) as ydl:
-        videos = await yt_dlp_search_blocking(ydl.extract_info, f"ytsearch15:{search}", download=False)
-        videos = videos['entries']
+    if cmd == "search":
+        IS_SEARCH_STARTED = True
+        response = ""
 
         for i in range(len(videos)):
             video_duration = time.strftime('%H:%M:%S', time.gmtime(videos[i]['duration']))
@@ -197,128 +251,130 @@ async def search(ctx: commands.Context, *, search: str = None):
 
             response += f"> **{i + 1})** `{videos[i]['title']}` **`[{video_duration}]`**\n> \n"
 
-    await message.edit(content=response[:response.rfind(">")] + response[response.rfind(">") + 1:])
+        await message.edit(content=response[:response.rfind(">")] + response[response.rfind(">") + 1:])
 
-    def is_digit(m):
-        return bIsSearchStarted and m.author == ctx.author and m.content.isdigit()
+        def is_digit(m):
+            return IS_SEARCH_STARTED and m.author == ctx.author and m.content.isdigit()
 
-    try:
-        msg = await bot.wait_for('message', check=is_digit, timeout=30.0)
-    except asyncio.TimeoutError:
-        await message.edit(content="Время ожидания истекло (30 секунд). Попробуйте ещё раз.")
-        return
-
-    selected_track = videos[int(msg.content) - 1]
-    add_track_to_queue(selected_track, ctx.guild)
-    current_track = TRACK_QUEUE[ctx.guild.id][-1]
-
-    await print_track_status(ctx, message, current_track)
-
-
-@bot.command()
-async def leave(ctx: commands.Context):
-    await ctx.voice_client.disconnect()
-    global TRACK_QUEUE
-    TRACK_QUEUE[ctx.guild.id] = []
-
-
-@bot.command(aliases=['p', 'P'])
-async def play(ctx: commands.Context, *, query: str = None):
-    global TRACK_QUEUE
-
-    if query is None:
-        await ctx.send("Требуется минимум одно ключевое слово!")
-        return
-
-    voice: discord.VoiceProtocol = ctx.author.voice
-
-    if voice is None:
-        await ctx.send("Вы должны быть в голосовом чате чтобы пользоваться ботом...")
-        return
-
-    if query.startswith(('http://', 'https://')) and not query.startswith(('http://youtube.com/', 'http://youtu.be/',
-                                                                           'http://www.youtube.com/', 'http://www.youtu.be/',
-                                                                           'https://youtube.com/', 'https://youtu.be/',
-                                                                           'https://www.youtube.com/', 'https://www.youtu.be/')):
-        await ctx.send("Разрешён только YouTube.")
-        return
-
-    try:
-        await voice.channel.connect()
-    except ClientException as e:
-        if str(e) != "Already connected to a voice channel.":
-            await ctx.send("Exception caught:" + str(e))
-
-    last_message = await ctx.send("Обрабатываю...")
-    channel: discord.TextChannel = bot.get_channel(ctx.channel.id)
-    message = await channel.fetch_message(last_message.id)
-
-    with YoutubeDL({'format': 'bestaudio', 'quiet': 'True', 'cookiefile': 'cookies.txt',
-                    "logger": YoutubeDL_Logger}) as ydl:
         try:
-            videos = ydl.extract_info(query, download=False)
-            try:
-                for video_num, video_in_playlist in enumerate(videos['entries']):
-                    add_track_to_queue(video_in_playlist, ctx.guild)
-                video = videos['entries'][-1]
-            except KeyError:
-                video = videos
-                add_track_to_queue(video, ctx.guild)
-        except yt_dlp.utils.DownloadError as error:
-            try:
-                video = ydl.extract_info(f"ytsearch:{query}", download=False)['entries'][0]
-                add_track_to_queue(video, ctx.guild)
-            except IndexError:
-                await last_message.edit(content=f"Поиск на YouTube вернул 0 результатов.")
-                return
+            msg = await bot.wait_for('message', check=is_digit, timeout=30.0)
+        except asyncio.TimeoutError:
+            await message.edit(content="Время ожидания истекло (30 секунд). Попробуйте ещё раз.")
+            return
 
-    current_track = TRACK_QUEUE[ctx.guild.id][-1]
+        videos = [videos[int(msg.content) - 1]]
 
-    await print_track_status(ctx, message, current_track)
+    # print(json.dumps(videos, indent=4))
+    add_tracks_to_queue(videos, ctx.guild)
 
 
-@bot.command(aliases=["q"])
-async def queue(ctx: commands.Context):
-    if ctx.guild.id not in TRACK_QUEUE:
-        await ctx.send("> `Очередь пустая.`\n")
-        return
+class MusicBot(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
 
-    response = ""
-    i = 0
-    for track in TRACK_QUEUE[ctx.guild.id]:
-        i += 1
-        video_duration = time.strftime('%H:%M:%S', time.gmtime(track['duration']))
 
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member, before, after):
+        LOGGER.info(f"Voice state changed from {before} to {after}.")
+
+
+    @commands.command(aliases=['p', 'P'])
+    async def play(self, ctx: commands.Context, *, query: str = None):
+        await play_or_search_track("play", ctx, query)
+
+
+    @commands.command(aliases=['s', 'S'])
+    async def search(self, ctx: commands.Context, *, query: str = None):
+        await play_or_search_track("search", ctx, query)
+
+
+    @commands.command(aliases=['q'])
+    async def queue(self, ctx: commands.Context):
+        if ctx.guild.id not in TRACK_QUEUE:
+            await ctx.send("> `Очередь пустая.`\n")
+            return
+
+        response = ""
+        i = 0
+        for track in TRACK_QUEUE[ctx.guild.id]["tracks"]:
+            i += 1
+            video_duration = time.strftime('%H:%M:%S', time.gmtime(track['duration']))
+
+            if not re.search("^00:", video_duration) is None:
+                video_duration = time.strftime('%M:%S', time.gmtime(track['duration']))
+
+            response += f"> **{i})** `{track['title']}` **`[{video_duration}]`**\n> \n"
+        if response == "":
+            await ctx.send("> `Очередь пустая.`\n")
+        else:
+            await ctx.send(response[:response.rfind(">")] + response[response.rfind(">") + 1:])
+
+
+    @commands.command()
+    async def np(self, ctx: commands.Context):
+        idx = get_current_track_id(ctx.guild.id)
+
+        if not idx:
+            await ctx.send("> Сейчас ничего не играет.")
+            return
+
+        current_track = TRACK_QUEUE[ctx.guild.id]["tracks"][idx]
+        video_duration = time.strftime('%H:%M:%S', time.gmtime(current_track['duration']))
         if not re.search("^00:", video_duration) is None:
-            video_duration = time.strftime('%M:%S', time.gmtime(track['duration']))
+            video_duration = time.strftime('%M:%S', time.gmtime(current_track['duration']))
 
-        response += f"> **{i})** `{track['title']}` **`[{video_duration}]`**\n> \n"
-    if response == "":
-        await ctx.send("> `Очередь пустая.`\n")
-    else:
-        await ctx.send(response[:response.rfind(">")] + response[response.rfind(">") + 1:])
+        await ctx.send(f"> Сейчас играет: `{current_track['title']}` **`{video_duration}`**")
 
 
-@bot.command()
-async def skip(ctx: commands.Context):
-    voice = get(bot.voice_clients)
-    if voice is not None:
-        voice.stop()
+    @commands.command()
+    async def skip(self, ctx: commands.Context):
+        voice = discord.utils.get(bot.voice_clients)
+        if voice is not None:
+            voice.stop()
 
 
-@bot.command()
-async def np(ctx: commands.Context):
-    current_track = get_current_track(ctx.guild)
-
-    if current_track is None:
-        await ctx.send("> Сейчас ничего не играет.")
-        return
-
-    video_duration = time.strftime('%H:%M:%S', time.gmtime(current_track['duration']))
-    if not re.search("^00:", video_duration) is None:
-        video_duration = time.strftime('%M:%S', time.gmtime(current_track['duration']))
-
-    await ctx.send(f"> Сейчас играет: `{current_track['title']}` **`{video_duration}`**")
+    @commands.command()
+    async def leave(self, ctx: commands.Context):
+        await ctx.voice_client.disconnect()
+        init_track_list(ctx.guild.id)
 
 
-bot.run(BOT_TOKEN)
+    async def run(self):
+        while True:
+            for guild_id in TRACK_QUEUE.keys():
+                if len(TRACK_QUEUE[guild_id]["tracks"]) > 0:
+                    await check_queue(guild_id)
+
+            await asyncio.sleep(3)
+
+
+def setup_logger():
+    logger = logging.getLogger('discord')
+    logger.setLevel(logging.DEBUG)
+
+    logging.getLogger('discord.http').setLevel(logging.FATAL)
+    logging.getLogger('discord.gateway').setLevel(logging.FATAL)
+    logging.getLogger('discord.client').setLevel(logging.FATAL)
+    logging.getLogger('discord.voice_client').setLevel(logging.FATAL)
+    logging.getLogger('discord.player').setLevel(logging.FATAL)
+
+    handler = logging.StreamHandler()
+
+    dt_fmt = '%H:%M:%S %d-%m-%Y '
+    formatter = logging.Formatter('[{asctime}] [{levelname:<8}] {name}: {message}', dt_fmt, style='{')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+    return logger
+
+
+async def main():
+    music_bot = MusicBot(bot)
+    await bot.add_cog(music_bot)
+    asyncio.create_task(bot.start(BOT_TOKEN))
+    await music_bot.run()
+
+
+if __name__ == "__main__":
+    LOGGER = setup_logger()
+    asyncio.run(main())
